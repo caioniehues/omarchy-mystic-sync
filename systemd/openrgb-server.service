@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenRGB SDK server (headless) for mystic-sync
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/openrgb --server --noautoconnect
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

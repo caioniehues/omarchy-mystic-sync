@@ -1,0 +1,223 @@
+"""Pure logic for mystic-sync: sensors, palettes, config. No hardware I/O here except sysfs reads."""
+import copy, glob, json, os
+
+SOURCES = ("cpu-temp", "gpu-temp", "cpu-load", "gpu-load", "hottest", "busiest", "off")
+PALETTES = {
+    # stops: (position 0..1, (r, g, b))
+    "thermal": [(0.0, (0, 90, 255)), (0.35, (0, 220, 200)), (0.55, (0, 255, 60)),
+                (0.75, (255, 200, 0)), (0.88, (255, 90, 0)), (1.0, (255, 0, 0))],
+    "ice-fire": [(0.0, (0, 160, 255)), (0.5, (170, 0, 255)), (1.0, (255, 0, 30))],
+    "traffic": [(0.0, (0, 255, 40)), (0.6, (255, 210, 0)), (1.0, (255, 0, 0))],
+    # No green, and blue stays at full until the last step: the second fan model on JRAINBOW1 has a far
+    # stronger blue, so green mixes and red-with-a-little-blue look different on it. These stops were
+    # matched by eye on both models; the magenta -> red step is kept short because its middle doesn't match.
+    "violet": [(0.0, (0, 0, 255)), (0.3, (90, 0, 255)), (0.6, (180, 0, 255)), (0.85, (255, 0, 255)),
+               (0.9, (255, 0, 0)), (1.0, (255, 0, 0))],
+}
+DEFAULTS = {
+    "enabled": True,
+    "brightness": 100,            # percent
+    "palette": "thermal",
+    "smoothing": 0.25,            # EMA weight of each new sample (1 = no smoothing)
+    "critical_flash": True,
+    "restore_profile": "pre-mystic-sync",   # OpenRGB profile applied when disabled/stopped ("" = leave as is)
+    "ranges": {                   # value mapped to palette start..end
+        "cpu-temp": [40, 90], "gpu-temp": [35, 85], "cpu-load": [0, 100], "gpu-load": [0, 100],
+    },
+    "critical": {"cpu-temp": 90, "gpu-hotspot": 100},
+    # device: substring of the OpenRGB controller name (default "MSI"); index: zone number on that controller.
+    # JRAINBOW2 (zone 3) is physically dead on this board, so it is left out.
+    "zones": {
+        "JRAINBOW1": {"label": "Fans", "source": "cpu-temp", "leds": 60, "index": 2},
+        "GPU": {"label": "Nitro+", "source": "gpu-temp", "leds": 1, "index": 0, "device": "Sapphire"},
+    },
+}
+MSI = "MSI"                       # the Mystic Light controller: its ARGB header zones are resizable
+UNITS = {"cpu-temp": "°C", "gpu-temp": "°C", "cpu-load": "%", "gpu-load": "%"}
+
+
+def merge(base, over):
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def validate(cfg):
+    """Raise ValueError on anything the daemon can't use."""
+    if not isinstance(cfg.get("enabled"), bool):
+        raise ValueError("enabled must be true/false")
+    if not (isinstance(cfg.get("brightness"), (int, float)) and 0 <= cfg["brightness"] <= 100):
+        raise ValueError("brightness must be 0-100")
+    if cfg.get("palette") not in PALETTES:
+        raise ValueError("palette must be one of " + ", ".join(PALETTES))
+    if not (isinstance(cfg.get("smoothing"), (int, float)) and 0 < cfg["smoothing"] <= 1):
+        raise ValueError("smoothing must be in (0, 1]")
+    for src, rng in cfg["ranges"].items():
+        if not (isinstance(rng, list) and len(rng) == 2 and all(isinstance(x, (int, float)) for x in rng) and rng[0] < rng[1]):
+            raise ValueError(f"ranges.{src} must be [low, high] with low < high")
+    for name, z in cfg["zones"].items():
+        if z.get("source") not in SOURCES:
+            raise ValueError(f"zones.{name}.source must be one of " + ", ".join(SOURCES))
+        if not (isinstance(z.get("leds"), int) and 1 <= z["leds"] <= 240):
+            raise ValueError(f"zones.{name}.leds must be 1-240")
+        if not (isinstance(z.get("index"), int) and z["index"] >= 0):
+            raise ValueError(f"zones.{name}.index must be a zone number")
+        z.setdefault("device", MSI)
+        if not (isinstance(z["device"], str) and z["device"].strip()):
+            raise ValueError(f"zones.{name}.device must be part of an OpenRGB controller name")
+    return cfg
+
+
+def config_path():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "mystic-sync", "config.json")
+
+
+def state_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "mystic-sync", "state.json")
+
+
+def load_config(path=None):
+    path = path or config_path()
+    try:
+        with open(path) as f:
+            user = json.load(f)
+    except FileNotFoundError:
+        user = {}
+    return validate(merge(DEFAULTS, user))
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def parse_value(raw):
+    """CLI value: JSON when it parses (true, 60, [40,90]), else a plain string."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def set_key(cfg, dotted, value):
+    keys = dotted.split(".")
+    node = cfg
+    for k in keys[:-1]:
+        if not isinstance(node.get(k), dict):
+            raise ValueError(f"unknown setting {dotted}")
+        node = node[k]
+    if keys[-1] not in node:
+        raise ValueError(f"unknown setting {dotted}")
+    node[keys[-1]] = value
+
+
+# ---------- colour ----------
+
+def palette_color(name, t):
+    stops = PALETTES[name]
+    t = max(0.0, min(1.0, t))
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if t <= p1:
+            f = 0 if p1 == p0 else (t - p0) / (p1 - p0)
+            return tuple(round(a + (b - a) * f) for a, b in zip(c0, c1))
+    return stops[-1][1]
+
+
+def scale(color, brightness):
+    return tuple(round(c * brightness / 100) for c in color)
+
+
+def hexcolor(c):
+    return "#%02x%02x%02x" % tuple(c)
+
+
+def normalize(value, rng):
+    lo, hi = rng
+    return max(0.0, min(1.0, (value - lo) / (hi - lo)))
+
+
+# ---------- sensors ----------
+
+class Sensors:
+    """Reads sysfs; 'root' lets tests point it at a fake tree."""
+
+    def __init__(self, root="/"):
+        self.root = root
+        self._prev_cpu = None
+        self.hwmon = {}
+        for d in glob.glob(os.path.join(root, "sys/class/hwmon/hwmon*")):
+            name = _read(os.path.join(d, "name"))
+            if name and name not in self.hwmon:
+                self.hwmon[name] = d
+        self.gpu_busy = None
+        for p in sorted(glob.glob(os.path.join(root, "sys/class/drm/card*/device/gpu_busy_percent"))):
+            if _read(os.path.join(os.path.dirname(p), "vendor")) == "0x1002":
+                self.gpu_busy = p
+                break
+
+    def _temp(self, chip, label):
+        d = self.hwmon.get(chip)
+        if not d:
+            return None
+        for lab in glob.glob(os.path.join(d, "temp*_label")):
+            if _read(lab) == label:
+                v = _read(lab.replace("_label", "_input"))
+                return int(v) / 1000 if v and v.lstrip("-").isdigit() else None
+        return None
+
+    def cpu_load(self):
+        line = _read(os.path.join(self.root, "proc/stat")).splitlines()[0].split()
+        vals = [int(x) for x in line[1:]]
+        idle, total = vals[3] + (vals[4] if len(vals) > 4 else 0), sum(vals)
+        prev, self._prev_cpu = self._prev_cpu, (idle, total)
+        if not prev or total == prev[1]:
+            return None
+        return 100 * (1 - (idle - prev[0]) / (total - prev[1]))
+
+    def read(self):
+        busy = _read(self.gpu_busy) if self.gpu_busy else ""
+        return {
+            "cpu-temp": self._temp("k10temp", "Tctl"),
+            "gpu-temp": self._temp("amdgpu", "edge"),
+            "gpu-hotspot": self._temp("amdgpu", "junction"),
+            "cpu-load": self.cpu_load(),
+            "gpu-load": float(busy) if busy.isdigit() else None,
+        }
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def zone_level(source, metrics, ranges):
+    """(value, unit, fraction 0..1) for a zone source; None fraction when unreadable or off."""
+    if source == "off":
+        return None, "", None
+    if source in ("hottest", "busiest"):
+        pool = ("cpu-temp", "gpu-temp") if source == "hottest" else ("cpu-load", "gpu-load")
+        best = None
+        for s in pool:
+            if metrics.get(s) is not None:
+                f = normalize(metrics[s], ranges[s])
+                if best is None or f > best[2]:
+                    best = (metrics[s], UNITS[s], f)
+        return best or (None, "", None)
+    v = metrics.get(source)
+    if v is None:
+        return None, UNITS.get(source, ""), None
+    return v, UNITS[source], normalize(v, ranges[source])
+
+
+def is_critical(metrics, limits):
+    return any(metrics.get(k) is not None and metrics[k] >= limit for k, limit in limits.items())

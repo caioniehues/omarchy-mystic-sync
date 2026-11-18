@@ -1,0 +1,46 @@
+{
+  "enabled": true,
+  "brightness": 100,
+  "palette": "violet",
+  "smoothing": 0.25,
+  "critical_flash": true,
+  "restore_profile": "pre-mystic-sync",
+  "ranges": {
+    "cpu-temp": [
+      40,
+      90
+    ],
+    "gpu-temp": [
+      35,
+      85
+    ],
+    "cpu-load": [
+      0,
+      100
+    ],
+    "gpu-load": [
+      0,
+      100
+    ]
+  },
+  "critical": {
+    "cpu-temp": 90,
+    "gpu-hotspot": 100
+  },
+  "zones": {
+    "JRAINBOW1": {
+      "label": "Fans",
+      "source": "cpu-temp",
+      "leds": 200,
+      "index": 2,
+      "device": "MSI"
+    },
+    "GPU": {
+      "label": "Nitro+",
+      "source": "gpu-temp",
+      "leds": 1,
+      "index": 0,
+      "device": "Sapphire"
+    }
+  }
+}

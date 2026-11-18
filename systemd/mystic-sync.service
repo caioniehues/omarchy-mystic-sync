@@ -1,0 +1,13 @@
+[Unit]
+Description=Colour Mystic Light ARGB headers by CPU/GPU temperature or load
+Requires=openrgb-server.service
+After=openrgb-server.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I %h/.config/omarchy/plugins/caioniehues.mystic-sync/bin/mystic-sync run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

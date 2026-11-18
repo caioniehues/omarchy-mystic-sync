@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""mystic-sync: colour MSI Mystic Light ARGB headers by CPU/GPU temperature or load, through OpenRGB's SDK server.
+
+  mystic-sync run                 daemon (systemd user service mystic-sync.service)
+  mystic-sync status              current state as JSON
+  mystic-sync get                 effective config as JSON
+  mystic-sync set KEY=VALUE ...   e.g. zones.JRAINBOW1.source=gpu-load brightness=60 enabled=false
+"""
+import json, os, signal, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mysticlib as M
+from orgb import OpenRGB
+
+TICK = 0.25          # seconds between sensor samples
+KEEPALIVE = 5.0      # resend colours this often even if unchanged (another client may have overwritten them)
+RESUME_GAP = 10.0    # wall-clock jump between ticks that means the PC slept: re-enable direct mode
+# Never re-send SETCUSTOMMODE routinely: on MSI 185-byte boards OpenRGB answers it with the
+# "enable per-LED" packet, which re-initialises the ARGB headers and blinks pass-through devices (GPU).
+MIN_DELTA = 3        # per-channel change that is worth sending
+
+
+class Daemon:
+    def __init__(self):
+        self.stop = False
+        self.client = None
+        self.devs = {}                       # device needle -> OpenRGB controller index
+        self.cfg = None
+        self.cfg_mtime = None
+        self.cfg_error = ""
+        self.smooth = {}
+        self.sent = {}
+        self.last_send = 0.0
+        self.restored = False
+        self.sensors = M.Sensors()
+        self.error = ""
+        self.last_wall = None
+
+    # ---- config ----
+    def reload_config(self):
+        path = M.config_path()
+        try:
+            mtime = os.stat(path).st_mtime
+        except FileNotFoundError:
+            mtime = 0
+        if self.cfg is not None and mtime == self.cfg_mtime:
+            return
+        self.cfg_mtime = mtime
+        try:
+            new = M.load_config(path)
+        except (ValueError, json.JSONDecodeError) as e:
+            self.cfg_error = f"config ignored: {e}"
+            if self.cfg is None:
+                self.cfg = M.validate(M.merge(M.DEFAULTS, {}))
+            return
+        self.cfg_error = ""
+        devices_changed = self.cfg is not None and self.needed(self.cfg) != self.needed(new)
+        sizes_changed = self.cfg is None or any(
+            self.cfg["zones"].get(n, {}).get("leds") != z["leds"] for n, z in new["zones"].items())
+        self.cfg = new
+        self.sent = {}                       # force a resend with the new settings
+        if devices_changed and self.client:
+            self.drop("")                    # reconnect to look up the new set of controllers
+        elif sizes_changed and self.client:
+            try:
+                self.prepare_device()
+            except OSError as e:
+                self.drop(f"lost OpenRGB connection: {e}")
+
+    # ---- OpenRGB ----
+    @staticmethod
+    def needed(cfg):
+        return sorted({z["device"] for z in cfg["zones"].values()})
+
+    def connect(self):
+        if self.client:
+            return True
+        try:
+            self.client = OpenRGB()
+            self.devs = {d: self.client.find(d) for d in self.needed(self.cfg)}
+            missing = [d for d, i in self.devs.items() if i is None]
+            if missing:                      # often just OpenRGB still detecting (MSI USB comes up last)
+                raise ConnectionError("OpenRGB server has no controller matching " + ", ".join(missing))
+            self.error = ""
+            self.sent = {}
+            if self.cfg["enabled"]:
+                self.prepare_device()
+            return True
+        except OSError as e:
+            self.drop(f"OpenRGB server unreachable: {e}")
+            return False
+
+    def drop(self, why):
+        self.error = why
+        if self.client:
+            try:
+                self.client.close()
+            except OSError:
+                pass
+        self.client, self.devs = None, {}
+
+    def prepare_device(self):
+        # Resize first: the MSI board only learns header lengths from the per-LED enable packet
+        # that custom mode sends, so a resize after it never reaches the hardware.
+        for z in self.cfg["zones"].values():
+            if z["device"] == M.MSI:         # only the ARGB headers have a settable length
+                self.client.resize_zone(self.devs[z["device"]], z["index"], z["leds"])
+        for i in self.devs.values():
+            self.client.custom_mode(i)       # GPU: no Direct mode, OpenRGB falls back to per-LED Static
+        self.restored = False
+
+    def restore(self):
+        name = self.cfg["restore_profile"] if self.cfg else ""
+        if self.client and name and not self.restored:
+            try:
+                self.client.load_profile(name)
+                self.client.ping()
+            except OSError:
+                pass
+        self.restored = True
+
+    # ---- main loop ----
+    def tick(self, now):
+        self.reload_config()
+        cfg = self.cfg
+        metrics = self.sensors.read()
+        a = cfg["smoothing"]
+        for k, v in metrics.items():
+            if v is not None:
+                self.smooth[k] = v if self.smooth.get(k) is None else self.smooth[k] + a * (v - self.smooth[k])
+        crit = cfg["critical_flash"] and M.is_critical(metrics, cfg["critical"])   # raw values: react at once
+
+        zones_state, colors = {}, {}
+        for name, z in cfg["zones"].items():
+            value, unit, frac = M.zone_level(z["source"], self.smooth, cfg["ranges"])
+            if frac is None:
+                color = (0, 0, 0)
+            else:
+                color = M.scale(M.palette_color(cfg["palette"], frac), cfg["brightness"])
+            if crit:
+                color = (255, 0, 0) if int(now * 2) % 2 == 0 else (0, 0, 0)
+            colors[name] = color
+            zones_state[name] = {"label": z["label"], "source": z["source"], "value": None if value is None else round(value, 1),
+                                 "unit": unit, "level": None if frac is None else round(frac, 3), "color": M.hexcolor(color)}
+
+        wall = time.time()
+        resumed = self.last_wall is not None and wall - self.last_wall > RESUME_GAP
+        self.last_wall = wall
+
+        if cfg["enabled"] and self.connect():
+            changed = any(name not in self.sent or max(abs(a - b) for a, b in zip(c, self.sent[name])) >= MIN_DELTA
+                          for name, c in colors.items())
+            if changed or resumed or self.restored or now - self.last_send >= KEEPALIVE:
+                try:
+                    if self.restored or resumed:
+                        self.prepare_device()               # back from disabled, or woke from sleep
+                    for name, c in colors.items():
+                        self.client.zone_colors(self.devs[cfg["zones"][name]["device"]], cfg["zones"][name]["index"], [c] * cfg["zones"][name]["leds"])
+                    self.sent, self.last_send = dict(colors), now
+                except OSError as e:
+                    self.drop(f"lost OpenRGB connection: {e}")
+        elif not cfg["enabled"]:
+            if self.connect():
+                self.restore()
+            self.sent = {}
+
+        lit = [z for z in zones_state.values() if z["level"] is not None]
+        accent = max(lit, key=lambda z: z["level"])["color"] if lit and cfg["enabled"] else ""
+        M.write_json(M.state_path(), {
+            "running": True, "connected": self.client is not None, "enabled": cfg["enabled"],
+            "error": self.cfg_error or self.error, "critical": bool(crit), "accent": accent,
+            "palette": cfg["palette"], "brightness": cfg["brightness"],
+            "metrics": {k: None if v is None else round(v, 1) for k, v in self.smooth.items()},
+            "zones": zones_state, "updated": time.time(),
+        })
+
+    def run(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: setattr(self, "stop", True))
+        self.reload_config()
+        backoff = 0.0
+        while not self.stop:
+            now = time.monotonic()
+            self.tick(now)
+            # unreachable server: back off up to 5 s between reconnect attempts, keep sampling meanwhile
+            backoff = min(5.0, backoff + 1) if self.client is None and self.cfg["enabled"] else 0.0
+            time.sleep(max(TICK, backoff))
+        self.restore()
+        try:
+            with open(M.state_path()) as f:
+                st = json.load(f)
+            st.update(running=False, connected=False)
+            M.write_json(M.state_path(), st)
+        except (OSError, ValueError):
+            pass
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "run":
+        Daemon().run()
+    elif cmd == "status":
+        try:
+            print(open(M.state_path()).read())
+        except FileNotFoundError:
+            print(json.dumps({"running": False}))
+    elif cmd == "get":
+        print(json.dumps(M.load_config(), indent=2))
+    elif cmd == "set":
+        path = M.config_path()
+        try:
+            with open(path) as f:
+                user = json.load(f)
+        except FileNotFoundError:
+            user = {}
+        cfg = M.merge(M.DEFAULTS, user)
+        for pair in argv[2:]:
+            key, sep, raw = pair.partition("=")
+            if not sep:
+                sys.exit(f"expected KEY=VALUE, got {pair!r}")
+            try:
+                M.set_key(cfg, key, M.parse_value(raw))
+            except ValueError as e:
+                sys.exit(str(e))
+        try:
+            M.validate(cfg)
+        except ValueError as e:
+            sys.exit(str(e))
+        M.write_json(path, cfg)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
