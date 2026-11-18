@@ -1,17 +1,17 @@
-import os, sys, tempfile, unittest
+import json, os, socket, sys, tempfile, threading, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin"))
 import mysticlib as M
 
 
 class Palette(unittest.TestCase):
     def test_endpoints_and_clamp(self):
-        self.assertEqual(M.palette_color("thermal", 0), (0, 90, 255))
-        self.assertEqual(M.palette_color("thermal", 1), (255, 0, 0))
-        self.assertEqual(M.palette_color("thermal", -3), (0, 90, 255))
-        self.assertEqual(M.palette_color("thermal", 7), (255, 0, 0))
+        self.assertEqual(M.palette_color(M.PALETTES["thermal"], 0), (0, 90, 255))
+        self.assertEqual(M.palette_color(M.PALETTES["thermal"], 1), (255, 0, 0))
+        self.assertEqual(M.palette_color(M.PALETTES["thermal"], -3), (0, 90, 255))
+        self.assertEqual(M.palette_color(M.PALETTES["thermal"], 7), (255, 0, 0))
 
     def test_midpoint_interpolates(self):
-        self.assertEqual(M.palette_color("ice-fire", 0.25), (85, 80, 255))
+        self.assertEqual(M.palette_color(M.PALETTES["ice-fire"], 0.25), (85, 80, 255))
 
     def test_brightness(self):
         self.assertEqual(M.scale((255, 100, 0), 50), (128, 50, 0))
@@ -43,7 +43,7 @@ class Config(unittest.TestCase):
     def test_rejects_bad_values(self):
         for over in ({"brightness": 150}, {"palette": "nope"}, {"zones": {"JRAINBOW1": {"source": "x"}}},
                      {"ranges": {"cpu-temp": [90, 40]}}, {"zones": {"JRAINBOW1": {"leds": 0}}},
-                     {"zones": {"GPU": {"device": ""}}}):
+                     {"zones": {"GPU": {"device": ""}}}, {"decay": 0}):
             with self.assertRaises(ValueError, msg=over):
                 M.validate(M.merge(M.DEFAULTS, over))
 
@@ -81,6 +81,88 @@ class FakeSysfs(unittest.TestCase):
             m = s.read()
             self.assertEqual((m["cpu-temp"], m["gpu-temp"], m["gpu-load"]), (55.25, 48, 37.0))
             self.assertAlmostEqual(m["cpu-load"], 200 / 3)
+
+
+class CustomPalettes(unittest.TestCase):
+    DUSK = [[0, "#0000ff"], [0.5, "#ff00ff"], [1, "#ff0000"]]
+
+    def cfg(self, **over):
+        return M.validate(M.merge(M.DEFAULTS, over))
+
+    def test_custom_palette_and_zone_override(self):
+        cfg = self.cfg(palettes={"dusk": self.DUSK}, zones={"GPU": {"palette": "dusk"}})
+        self.assertEqual(M.palette_color(M.stops("dusk", cfg["palettes"]), 0.25), (128, 0, 255))
+        self.assertEqual(M.stops(cfg["palette"], cfg["palettes"]), M.PALETTES["thermal"])
+
+    def test_bad_palettes_rejected(self):
+        for pals in ({"thermal": self.DUSK}, {"Bad Name": self.DUSK}, {"x": [[0, "#000000"]]},
+                     {"x": [[0.1, "#000000"], [1, "#ffffff"]]}, {"x": [[0, "#000000"], [0.7, "#000000"], [0.5, "#000000"], [1, "#ffffff"]]},
+                     {"x": [[0, "red"], [1, "#ffffff"]]}):
+            with self.assertRaises(ValueError, msg=pals):
+                self.cfg(palettes=pals)
+        with self.assertRaises(ValueError):
+            self.cfg(zones={"GPU": {"palette": "nope"}})
+
+    def test_create_and_delete_through_set_key(self):
+        cfg = M.merge(M.DEFAULTS, {})
+        M.set_key(cfg, "palettes.dusk", self.DUSK)
+        M.set_key(cfg, "zones.GPU.palette", "dusk")
+        M.validate(cfg)
+        with self.assertRaisesRegex(ValueError, "in use by zones.GPU"):
+            M.set_key(cfg, "palettes.dusk", None)
+        M.set_key(cfg, "zones.GPU.palette", None)
+        M.set_key(cfg, "palettes.dusk", None)
+        self.assertNotIn("dusk", cfg["palettes"])
+        self.assertNotIn("palette", M.validate(cfg)["zones"]["GPU"])
+
+
+class Preview(unittest.TestCase):
+    def test_fresh_valid_preview_only(self):
+        path = os.path.join(tempfile.mkdtemp(), "preview.json")
+        self.assertIsNone(M.read_preview(path))
+        with open(path, "w") as f:
+            json.dump({"zone": "JRAINBOW1", "color": "#ff8000"}, f)
+        self.assertEqual(M.read_preview(path), ("JRAINBOW1", (255, 128, 0)))
+        os.utime(path, (0, 0))                        # stale: the panel stopped refreshing it
+        self.assertIsNone(M.read_preview(path))
+        with open(path, "w") as f:
+            f.write("{}")                             # what the panel writes when a stop is deselected
+        self.assertIsNone(M.read_preview(path))
+
+
+class Smoothing(unittest.TestCase):
+    def test_rises_fast_falls_slow(self):
+        self.assertEqual(M.smooth(None, 70, 0.5, 0.05), 70)        # first sample is taken as is
+        self.assertEqual(M.smooth(50, 70, 0.5, 0.05), 60)
+        self.assertAlmostEqual(M.smooth(70, 50, 0.5, 0.05), 69)
+
+
+class Screens(unittest.TestCase):
+    def hypr(self, monitors):
+        """Fake Hyprland instance answering one j/monitors request; returns the runtime dir."""
+        runtime = tempfile.mkdtemp()
+        os.makedirs(os.path.join(runtime, "hypr", "stale"))
+        open(os.path.join(runtime, "hypr", "stale", ".socket.sock"), "w").close()   # dead socket file: skipped
+        os.makedirs(os.path.join(runtime, "hypr", "live"))
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(os.path.join(runtime, "hypr", "live", ".socket.sock"))
+        srv.listen(1)
+        def serve():
+            conn, _ = srv.accept()
+            with conn:
+                self.assertEqual(conn.recv(64), b"j/monitors")
+                conn.sendall(json.dumps(monitors).encode())
+            srv.close()
+        threading.Thread(target=serve, daemon=True).start()
+        return runtime
+
+    def test_dark_only_when_every_monitor_is_off(self):
+        self.assertTrue(M.screens_off(self.hypr([{"dpmsStatus": False}, {"dpmsStatus": False}])))
+        self.assertFalse(M.screens_off(self.hypr([{"dpmsStatus": False}, {"dpmsStatus": True}])))
+        self.assertFalse(M.screens_off(self.hypr([])))
+
+    def test_no_hyprland_keeps_lights_on(self):
+        self.assertFalse(M.screens_off(tempfile.mkdtemp()))
 
 
 if __name__ == "__main__":

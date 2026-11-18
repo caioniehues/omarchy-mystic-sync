@@ -34,11 +34,108 @@ Panel {
     { value: "cpu-load", label: "CPU load" }, { value: "gpu-load", label: "GPU load" },
     { value: "busiest", label: "Busiest", tooltip: "Whichever of CPU/GPU is busier" }
   ]
-  readonly property var palettes: [
-    { value: "thermal", label: "Thermal" }, { value: "ice-fire", label: "Ice → fire" }, { value: "traffic", label: "Traffic" }, { value: "violet", label: "Violet" }
-  ]
+  readonly property var paletteLabels: ({ "thermal": "Thermal", "ice-fire": "Ice → fire", "traffic": "Traffic", "violet": "Violet" })
+  readonly property var paletteOptions: st && st.palettes
+    ? Object.keys(st.palettes).map(function(n) { return { value: n, label: root.paletteLabels[n] || n } }) : []
+  // Colours that look the same on both fan models (README, "Mixed fan models render colours differently")
+  readonly property var matchedColors: ["#ff0000", "#00ff00", "#0000ff", "#5a00ff", "#b400ff", "#ff00ff"]
+
+  // ---- palette composer: edits a copy; Save writes it through the CLI, which validates ----
+  property string cName: ""
+  property var cStops: []            // [{ pos: 0..1, color: "#rrggbb" }], first at 0, last at 1
+  property int cSel: -1              // selected stop; while >= 0 it is previewed on cZone
+  property string cZone: ""
+  property string cError: ""
+  readonly property bool cMiddle: cSel > 0 && cSel < cStops.length - 1
+  readonly property var previewZones: st && st.zones
+    ? Object.keys(st.zones).filter(function(n) { return st.zones[n].source !== "off" })
+        .map(function(n) { return { value: n, label: st.zones[n].label } }) : []
 
   function set(pairs) { Quickshell.execDetached([root.cli, "set"].concat(pairs)) }
+  function run(pairs) { root.cError = ""; cliProc.command = [root.cli, "set"].concat(pairs); cliProc.running = true }
+
+  function hex(r, g, b) {
+    return "#" + [r, g, b].map(function(v) { return ("0" + Math.max(0, Math.min(255, Math.round(v))).toString(16)).slice(-2) }).join("")
+  }
+  function channel(h, i) { return parseInt(h.substr(1 + 2 * i, 2), 16) }
+  function sample(t) {                 // same interpolation as mysticlib.palette_color
+    var s = root.cStops
+    if (!s.length) return "#000000"
+    for (var i = 1; i < s.length; i++) {
+      if (t <= s[i].pos) {
+        var a = s[i - 1], b = s[i], f = b.pos === a.pos ? 0 : (t - a.pos) / (b.pos - a.pos)
+        function mix(k) { return root.channel(a.color, k) + (root.channel(b.color, k) - root.channel(a.color, k)) * f }
+        return root.hex(mix(0), mix(1), mix(2))
+      }
+    }
+    return s[s.length - 1].color
+  }
+  function loadPalette(n) {
+    if (!st || !st.palettes || !st.palettes[n]) return
+    root.cStops = st.palettes[n].map(function(s) { return { pos: s[0], color: s[1] } })
+    root.cName = st.builtin.indexOf(n) >= 0 ? n + "-2" : n
+    root.cSel = -1
+    root.cError = ""
+    root.pushPreview()
+  }
+  function select(i) { root.cSel = root.cSel === i ? -1 : i; root.pushPreview() }
+  function editStop(i, change) {
+    var s = root.cStops.slice()
+    s[i] = Object.assign({}, s[i], change)
+    root.cStops = s
+    root.pushPreview()
+  }
+  function setChannel(ch, v) {
+    var c = [0, 1, 2].map(function(k) { return root.channel(root.cStops[root.cSel].color, k) })
+    c[ch] = v
+    root.editStop(root.cSel, { color: root.hex(c[0], c[1], c[2]) })
+  }
+  function addStop() {                 // split the widest gap, starting with the colour already there
+    var s = root.cStops, i = 0
+    for (var k = 1; k < s.length - 1; k++) if (s[k + 1].pos - s[k].pos > s[i + 1].pos - s[i].pos) i = k
+    var p = Math.round((s[i].pos + s[i + 1].pos) * 500) / 1000
+    var next = s.slice()
+    next.splice(i + 1, 0, { pos: p, color: root.sample(p) })
+    root.cStops = next
+    root.cSel = i + 1
+    root.pushPreview()
+  }
+  function removeStop() {
+    var s = root.cStops.slice()
+    s.splice(root.cSel, 1)
+    root.cStops = s
+    root.cSel = -1
+    root.pushPreview()
+  }
+  function save() {
+    if (!/^[a-z0-9-]+$/.test(root.cName) || st.builtin.indexOf(root.cName) >= 0) {
+      root.cError = "Name: lowercase letters, digits and -, and not a built-in name."
+      return
+    }
+    root.run(["palettes." + root.cName + "=" + JSON.stringify(root.cStops.map(function(s) { return [Math.round(s.pos * 1000) / 1000, s.color] }))])
+  }
+  function pushPreview() {
+    previewFile.setText(root.opened && root.cSel >= 0 && root.cZone && root.cStops[root.cSel]
+      ? JSON.stringify({ zone: root.cZone, color: root.cStops[root.cSel].color }) : "{}")
+  }
+  onOpenedChanged: if (!opened) { root.cSel = -1; root.pushPreview() }
+
+  FileView {
+    id: previewFile
+    path: Quickshell.env("XDG_RUNTIME_DIR") + "/mystic-sync/preview.json"
+    atomicWrites: true
+    printErrors: false
+  }
+  Timer {                              // the daemon drops a preview older than 3 s, so keep it fresh
+    interval: 1000
+    running: root.opened && root.cSel >= 0
+    repeat: true
+    onTriggered: root.pushPreview()
+  }
+  Process {
+    id: cliProc
+    stderr: StdioCollector { onStreamFinished: if (text.trim()) root.cError = text.trim() }
+  }
   function fmt(v, unit) { return v === null || v === undefined ? "—" : Math.round(v) + (unit === "%" ? "%" : "°") }
 
   FileView {
@@ -49,6 +146,8 @@ Panel {
       try {
         root.st = JSON.parse(text())
         root.stale = (Date.now() / 1000 - (root.st.updated || 0)) > 10
+        if (!root.cStops.length && root.st.palettes) root.loadPalette(root.st.palette)
+        if (!root.cZone && root.previewZones.length) root.cZone = root.previewZones[0].value
       } catch (e) { root.stale = true }
     }
     onLoadFailed: { root.st = null; root.stale = true }
@@ -191,6 +290,16 @@ Panel {
                 fontFamily: root.bar.fontFamily
                 onChanged: function(v) { root.set(["zones." + zoneCol.modelData + ".source=" + v]) }
               }
+              Dropdown {
+                width: parent.width
+                label: "Palette"
+                value: zoneCol.zone.palette || ""
+                options: [{ value: "", label: "Default (" + (root.paletteLabels[root.st.palette] || root.st.palette) + ")" }].concat(root.paletteOptions)
+                foreground: root.bar.foreground
+                background: root.bar.background
+                fontFamily: root.bar.fontFamily
+                onChanged: function(v) { root.set(["zones." + zoneCol.modelData + ".palette=" + (v === "" ? "null" : v)]) }
+              }
             }
           }
 
@@ -201,9 +310,11 @@ Panel {
             width: parent.width
             spacing: Style.space(8)
 
-            PanelSectionHeader { text: "PALETTE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
-            ButtonGroup {
-              options: root.palettes
+            PanelSectionHeader { text: "DEFAULT PALETTE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+            Dropdown {
+              width: parent.width
+              showLabel: false
+              options: root.paletteOptions
               value: root.st ? root.st.palette : ""
               foreground: root.bar.foreground
               background: root.bar.background
@@ -226,6 +337,163 @@ Panel {
                 onReleased: function(v) { root.set(["brightness=" + Math.round(v)]) }
               }
             }
+          }
+
+          PanelSeparator { visible: root.live; foreground: root.bar.foreground }
+
+          Column {
+            id: composer
+            visible: root.live && root.cStops.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader { text: "COMPOSE PALETTE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
+            Dropdown {
+              width: parent.width
+              label: "Start from"
+              value: root.st && root.st.palettes && root.st.palettes[root.cName] ? root.cName : ""
+              options: root.paletteOptions
+              foreground: root.bar.foreground
+              background: root.bar.background
+              fontFamily: root.bar.fontFamily
+              onChanged: function(v) { root.loadPalette(v) }
+            }
+            TextField {
+              width: parent.width
+              text: root.cName
+              placeholderText: "palette name"
+              foreground: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              onTextEdited: root.cName = text
+            }
+
+            Row {                        // the palette as the lights would sweep through it
+              width: parent.width
+              height: Style.space(22)
+              Repeater {
+                model: 64
+                Rectangle {
+                  required property int index
+                  width: composer.width / 64
+                  height: parent.height
+                  color: root.sample(index / 63)
+                }
+              }
+            }
+            Item {                       // stops: click one to edit it and preview it on the lights
+              width: parent.width
+              height: Style.space(26)
+              Repeater {
+                model: root.cStops
+                Rectangle {
+                  required property var modelData
+                  required property int index
+                  x: modelData.pos * (parent.width - width)
+                  width: Style.space(22); height: Style.space(22)
+                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                  color: modelData.color
+                  border.width: index === root.cSel ? 3 : 1
+                  border.color: index === root.cSel ? root.bar.foreground : Qt.darker(root.bar.foreground, 2)
+                  MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.select(parent.index) }
+                }
+              }
+            }
+
+            Column {
+              visible: root.cSel >= 0 && root.cSel < root.cStops.length
+              width: parent.width
+              spacing: Style.space(6)
+              readonly property var stop: visible ? root.cStops[root.cSel] : ({ pos: 0, color: "#000000" })
+
+              PlainNote {
+                text: "Stop " + (root.cSel + 1) + " at " + Math.round(parent.stop.pos * 100) + "%, shown on the lights while selected"
+              }
+              ButtonGroup {
+                options: root.previewZones
+                value: root.cZone
+                foreground: root.bar.foreground
+                background: root.bar.background
+                fontFamily: root.bar.fontFamily
+                onChanged: function(v) { root.cZone = v; root.pushPreview() }
+              }
+              Row {
+                visible: root.cMiddle
+                spacing: Style.space(8)
+                Text { width: Style.space(36); text: "Pos"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+                PanelSlider {
+                  width: composer.width - Style.space(44)
+                  height: Style.space(28)
+                  bar: root.bar
+                  minimum: root.cMiddle ? root.cStops[root.cSel - 1].pos + 0.01 : 0
+                  maximum: root.cMiddle ? root.cStops[root.cSel + 1].pos - 0.01 : 1
+                  step: 0.01
+                  value: root.cMiddle ? root.cStops[root.cSel].pos : 0
+                  onMoved: function(v) { root.editStop(root.cSel, { pos: Math.round(v * 100) / 100 }) }
+                }
+              }
+              Repeater {
+                model: ["R", "G", "B"]
+                Row {
+                  required property string modelData
+                  required property int index
+                  spacing: Style.space(8)
+                  Text { width: Style.space(36); text: parent.modelData; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+                  PanelSlider {
+                    width: composer.width - Style.space(44)
+                    height: Style.space(28)
+                    bar: root.bar
+                    minimum: 0
+                    maximum: 255
+                    step: 1
+                    integer: true
+                    value: root.cSel >= 0 && root.cStops[root.cSel] ? root.channel(root.cStops[root.cSel].color, parent.index) : 0
+                    onMoved: function(v) { root.setChannel(parent.index, v) }
+                  }
+                }
+              }
+              Row {
+                spacing: Style.space(6)
+                TextField {
+                  width: Style.space(110)
+                  text: parent.parent.stop.color
+                  foreground: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                  onAccepted: if (/^#[0-9a-fA-F]{6}$/.test(text)) root.editStop(root.cSel, { color: text.toLowerCase() })
+                }
+                Repeater {               // known to match on both fan models
+                  model: root.matchedColors
+                  Rectangle {
+                    required property string modelData
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(22); height: Style.space(22)
+                    radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+                    color: modelData
+                    border.width: 1
+                    border.color: Qt.darker(root.bar.foreground, 2)
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.editStop(root.cSel, { color: parent.modelData }) }
+                  }
+                }
+              }
+            }
+
+            Flow {
+              width: parent.width
+              spacing: Style.space(6)
+              Button { text: "Add stop"; enabled: root.cStops.length < 8; bordered: true; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; onClicked: root.addStop() }
+              Button { text: "Remove stop"; enabled: root.cMiddle && root.cStops.length > 2; bordered: true; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; onClicked: root.removeStop() }
+              Button { text: "Save"; bordered: true; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; onClicked: root.save() }
+              Button {
+                text: "Delete"
+                visible: root.st && root.st.palettes && root.st.palettes[root.cName] !== undefined && root.st.builtin.indexOf(root.cName) < 0
+                bordered: true
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                onClicked: root.run(["palettes." + root.cName + "=null"])
+              }
+            }
+            PlainNote { visible: root.cError !== ""; color: root.bar.urgent; text: root.cError }
           }
 
           Text {

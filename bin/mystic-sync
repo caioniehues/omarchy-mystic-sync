@@ -14,6 +14,7 @@ from orgb import OpenRGB
 
 TICK = 0.05          # seconds between samples: sysfs reads take ~0.2 ms and OpenRGB queues updates per device, so the loop is the only lag
 KEEPALIVE = 5.0      # resend colours this often even if unchanged (another client may have overwritten them)
+SCREEN_CHECK = 0.25   # ask Hyprland whether the screens are off this often (~0.1 ms a query)
 RESUME_GAP = 10.0    # wall-clock jump between ticks that means the PC slept: re-enable direct mode
 # Never re-send SETCUSTOMMODE routinely: on MSI 185-byte boards OpenRGB answers it with the
 # "enable per-LED" packet, which re-initialises the ARGB headers and blinks pass-through devices (GPU).
@@ -39,6 +40,8 @@ class Daemon:
         self.sensors = M.Sensors()
         self.error = ""
         self.last_wall = None
+        self.dark = False
+        self.last_screen = float("-inf")
 
     # ---- config ----
     def reload_config(self):
@@ -128,24 +131,31 @@ class Daemon:
         self.reload_config()
         cfg = self.cfg
         metrics = self.sensors.read()
-        a = cfg["smoothing"]
         for k, v in metrics.items():
             if v is not None:
-                self.smooth[k] = v if self.smooth.get(k) is None else self.smooth[k] + a * (v - self.smooth[k])
+                self.smooth[k] = M.smooth(self.smooth.get(k), v, cfg["smoothing"], cfg["decay"])
+        if now - self.last_screen >= SCREEN_CHECK:
+            self.dark, self.last_screen = M.screens_off(), now
         crit = cfg["critical_flash"] and M.is_critical(metrics, cfg["critical"])   # raw values: react at once
 
+        preview = M.read_preview()
         zones_state, colors = {}, {}
         for name, z in cfg["zones"].items():
             value, unit, frac = M.zone_level(z["source"], self.smooth, cfg["ranges"])
             if frac is None:
                 color = (0, 0, 0)
             else:
-                color = M.scale(M.palette_color(cfg["palette"], frac), cfg["brightness"])
-            if crit:
+                color = M.scale(M.palette_color(M.stops(z.get("palette", cfg["palette"]), cfg["palettes"]), frac), cfg["brightness"])
+            if preview and preview[0] == name:     # the composer is showing a stop on this zone
+                color = M.scale(preview[1], cfg["brightness"])
+            if self.dark:
+                color = (0, 0, 0)
+            if crit:                                 # a warning shows even while dark
                 color = (255, 0, 0) if int(now * 2) % 2 == 0 else (0, 0, 0)
             colors[name] = color
             zones_state[name] = {"label": z["label"], "source": z["source"], "value": None if value is None else round(value, 1),
-                                 "unit": unit, "level": None if frac is None else round(frac, 3), "color": M.hexcolor(color)}
+                                 "unit": unit, "level": None if frac is None else round(frac, 3), "color": M.hexcolor(color),
+                                 "palette": z.get("palette", "")}
 
         wall = time.time()
         resumed = self.last_wall is not None and wall - self.last_wall > RESUME_GAP
@@ -172,8 +182,9 @@ class Daemon:
         accent = max(lit, key=lambda z: z["level"])["color"] if lit and cfg["enabled"] else ""
         M.write_json(M.state_path(), {
             "running": True, "connected": self.client is not None, "enabled": cfg["enabled"],
-            "error": self.cfg_error or self.error, "critical": bool(crit), "accent": accent,
-            "palette": cfg["palette"], "brightness": cfg["brightness"],
+            "error": self.cfg_error or self.error, "critical": bool(crit), "dark": self.dark, "accent": accent,
+            "palette": cfg["palette"], "brightness": cfg["brightness"], "builtin": list(M.PALETTES),
+            "palettes": {n: [[p, M.hexcolor(c)] for p, c in M.stops(n, cfg["palettes"])] for n in [*M.PALETTES, *cfg["palettes"]]},
             "metrics": {k: None if v is None else round(v, 1) for k, v in self.smooth.items()},
             "zones": zones_state, "updated": time.time(),
         })

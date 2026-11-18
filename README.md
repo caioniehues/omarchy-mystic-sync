@@ -9,10 +9,13 @@ Everything goes through OpenRGB's SDK server; the daemon is plain Python
   `gpu-load`, `hottest`, `busiest` or `off`.
 - The value is mapped through a palette (`thermal`, `ice-fire`, `traffic`,
   `violet`) and smoothed, so colours drift instead of flickering.
+- When Hyprland turns every screen off (Omarchy does this 5 s after locking),
+  the lights go dark; they come back within a quarter second of the screen.
 - Past a critical temperature (CPU 90 °C, GPU hotspot 100 °C by default)
   every zone flashes red.
 - The bar icon takes the colour of the hottest zone; its panel shows each
-  zone's reading and lets you change source, palette and brightness.
+  zone's reading and lets you change source, palette and brightness, and has
+  a palette composer: drag a stop's colour and the lights show it live.
 - Right-click the icon to pause. Paused or stopped, the daemon loads the OpenRGB
   profile named in `restore_profile`.
 
@@ -68,8 +71,10 @@ bin/mystic-sync status    # live readings, colours, connection state
 |---|---|
 | `enabled` | `false` pauses and loads `restore_profile` |
 | `brightness` | 0–100 % |
-| `palette` | `thermal`, `ice-fire`, `traffic` or `violet` |
-| `smoothing` | weight of each new sample (20 per second), (0, 1]; 0.25 settles in about half a second, 1 = no smoothing |
+| `palette` | default palette: `thermal`, `ice-fire`, `traffic`, `violet` or a custom one |
+| `palettes.<name>` | a custom palette: 2–8 stops `[position, "#rrggbb"]`, rising from 0 to 1; `null` deletes it (refused while in use) |
+| `smoothing` | weight of a sample above the smoothed reading (20 per second), (0, 1]; 0.5 settles in about 0.2 s, 1 = no smoothing |
+| `decay` | the same for a sample below it; 0.05 fades out over about 3 s, so heat shows at once and cooling drifts |
 | `critical_flash`, `critical` | flash red at these raw readings |
 | `ranges.<source>` | `[low, high]` mapped to the palette's start and end |
 | `zones.<name>` | see below |
@@ -77,9 +82,11 @@ bin/mystic-sync status    # live readings, colours, connection state
 A zone:
 
 ```json
-"GPU": { "label": "Nitro+", "source": "gpu-temp", "device": "Sapphire", "index": 0, "leds": 1 }
+"GPU": { "label": "Nitro+", "source": "gpu-temp", "device": "Sapphire", "index": 0, "leds": 1, "palette": "ice-fire" }
 ```
 
+- `palette` (optional): this zone's palette instead of the default one;
+  `bin/mystic-sync set zones.GPU.palette=null` goes back to the default.
 - `device`: part of the OpenRGB controller name. Leave it out for the MSI
   board (`"MSI"`).
 - `index`: zone number on that controller. On the MS-7E26: 0 JRGB1,
