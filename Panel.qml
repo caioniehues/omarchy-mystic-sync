@@ -46,7 +46,17 @@ Panel {
   property int cSel: -1              // selected stop; while >= 0 it is previewed on cZone
   property string cZone: ""
   property string cError: ""
+  property bool composing: false     // the panel shows the composer instead of the zones
   readonly property bool cMiddle: cSel > 0 && cSel < cStops.length - 1
+  // Stops are stored 0..1 and shown in the units of the previewed zone's source (a palette fits any range).
+  // hottest/busiest mix two ranges, so they and "off" fall back to percent of range.
+  readonly property string cSource: st && st.zones && st.zones[cZone] ? st.zones[cZone].source : ""
+  readonly property var cRange: st && st.ranges && st.ranges[cSource] ? st.ranges[cSource] : null
+  readonly property var cSpan: cRange || [0, 100]
+  readonly property string cUnit: cRange ? (cSource.indexOf("temp") >= 0 ? " °C" : "%") : "% of range"
+  function toUnit(p) { return root.cSpan[0] + p * (root.cSpan[1] - root.cSpan[0]) }
+  function fromUnit(v) { return Math.round((v - root.cSpan[0]) / (root.cSpan[1] - root.cSpan[0]) * 1000) / 1000 }
+  function posLabel(p) { return Math.round(root.toUnit(p)) + root.cUnit }
   readonly property var previewZones: st && st.zones
     ? Object.keys(st.zones).filter(function(n) { return st.zones[n].source !== "off" })
         .map(function(n) { return { value: n, label: st.zones[n].label } }) : []
@@ -118,7 +128,8 @@ Panel {
     previewFile.setText(root.opened && root.cSel >= 0 && root.cZone && root.cStops[root.cSel]
       ? JSON.stringify({ zone: root.cZone, color: root.cStops[root.cSel].color }) : "{}")
   }
-  onOpenedChanged: if (!opened) { root.cSel = -1; root.pushPreview() }
+  onOpenedChanged: if (!opened) { root.composing = false; root.cSel = -1; root.pushPreview() }
+  function closeComposer() { root.composing = false; root.cSel = -1; root.pushPreview() }
 
   FileView {
     id: previewFile
@@ -243,6 +254,7 @@ Panel {
 
             Column {
               id: zoneCol
+              visible: !root.composing
               required property string modelData
               readonly property var zone: root.st.zones[modelData]
               width: panelColumn.width
@@ -303,10 +315,10 @@ Panel {
             }
           }
 
-          PanelSeparator { visible: root.live; foreground: root.bar.foreground }
+          PanelSeparator { visible: root.live && !root.composing; foreground: root.bar.foreground }
 
           Column {
-            visible: root.live
+            visible: root.live && !root.composing
             width: parent.width
             spacing: Style.space(8)
 
@@ -321,6 +333,7 @@ Panel {
               fontFamily: root.bar.fontFamily
               onChanged: function(v) { root.set(["palette=" + v]) }
             }
+            Button { text: "Compose palette…"; bordered: true; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; onClicked: root.composing = true }
 
             PanelSectionHeader { text: "BRIGHTNESS"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
             Item {
@@ -339,14 +352,13 @@ Panel {
             }
           }
 
-          PanelSeparator { visible: root.live; foreground: root.bar.foreground }
-
           Column {
             id: composer
-            visible: root.live && root.cStops.length > 0
+            visible: root.live && root.composing && root.cStops.length > 0
             width: parent.width
             spacing: Style.space(8)
 
+            Button { text: "← Back"; bordered: true; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; onClicked: root.closeComposer() }
             PanelSectionHeader { text: "COMPOSE PALETTE"; foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
             Dropdown {
               width: parent.width
@@ -381,6 +393,12 @@ Panel {
                 }
               }
             }
+            Item {                       // the range ends, in the previewed zone's units
+              width: parent.width
+              height: lowText.implicitHeight
+              Text { id: lowText; text: root.posLabel(0); color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+              Text { anchors.right: parent.right; text: root.posLabel(1); color: Qt.darker(root.bar.foreground, 1.4); font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+            }
             Item {                       // stops: click one to edit it and preview it on the lights
               width: parent.width
               height: Style.space(26)
@@ -407,7 +425,7 @@ Panel {
               readonly property var stop: visible ? root.cStops[root.cSel] : ({ pos: 0, color: "#000000" })
 
               PlainNote {
-                text: "Stop " + (root.cSel + 1) + " at " + Math.round(parent.stop.pos * 100) + "%, shown on the lights while selected"
+                text: "Stop " + (root.cSel + 1) + " at " + root.posLabel(parent.stop.pos) + ", shown on the lights while selected"
               }
               ButtonGroup {
                 options: root.previewZones
@@ -425,11 +443,12 @@ Panel {
                   width: composer.width - Style.space(44)
                   height: Style.space(28)
                   bar: root.bar
-                  minimum: root.cMiddle ? root.cStops[root.cSel - 1].pos + 0.01 : 0
-                  maximum: root.cMiddle ? root.cStops[root.cSel + 1].pos - 0.01 : 1
-                  step: 0.01
-                  value: root.cMiddle ? root.cStops[root.cSel].pos : 0
-                  onMoved: function(v) { root.editStop(root.cSel, { pos: Math.round(v * 100) / 100 }) }
+                  minimum: root.cMiddle ? Math.ceil(root.toUnit(root.cStops[root.cSel - 1].pos)) + 1 : root.cSpan[0]
+                  maximum: root.cMiddle ? Math.floor(root.toUnit(root.cStops[root.cSel + 1].pos)) - 1 : root.cSpan[1]
+                  step: 1
+                  integer: true
+                  value: root.cMiddle ? root.toUnit(root.cStops[root.cSel].pos) : 0
+                  onMoved: function(v) { root.editStop(root.cSel, { pos: root.fromUnit(v) }) }
                 }
               }
               Repeater {
@@ -476,6 +495,34 @@ Panel {
                   }
                 }
               }
+            }
+
+            Flow {                       // range of the previewed zone's source; shared by every zone on that source
+              visible: root.cRange !== null
+              width: parent.width
+              spacing: Style.space(12)
+              NumberField {
+                label: "Low"
+                from: 0
+                to: root.cRange ? root.cRange[1] - 1 : 100
+                value: root.cRange ? root.cRange[0] : 0
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                onModified: function(v) { root.run(["ranges." + root.cSource + "=" + JSON.stringify([v, root.cRange[1]])]) }
+              }
+              NumberField {
+                label: "High"
+                from: root.cRange ? root.cRange[0] + 1 : 1
+                to: root.cSource.indexOf("temp") >= 0 ? 125 : 100
+                value: root.cRange ? root.cRange[1] : 100
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                onModified: function(v) { root.run(["ranges." + root.cSource + "=" + JSON.stringify([root.cRange[0], v])]) }
+              }
+            }
+            PlainNote {
+              visible: root.cRange === null && root.cSel >= 0
+              text: "Hottest and Busiest use each reading's own range, so positions show as a percentage."
             }
 
             Flow {

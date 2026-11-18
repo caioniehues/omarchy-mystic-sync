@@ -183,7 +183,7 @@ class Daemon:
         M.write_json(M.state_path(), {
             "running": True, "connected": self.client is not None, "enabled": cfg["enabled"],
             "error": self.cfg_error or self.error, "critical": bool(crit), "dark": self.dark, "accent": accent,
-            "palette": cfg["palette"], "brightness": cfg["brightness"], "builtin": list(M.PALETTES),
+            "palette": cfg["palette"], "brightness": cfg["brightness"], "builtin": list(M.PALETTES), "ranges": cfg["ranges"],
             "palettes": {n: [[p, M.hexcolor(c)] for p, c in M.stops(n, cfg["palettes"])] for n in [*M.PALETTES, *cfg["palettes"]]},
             "metrics": {k: None if v is None else round(v, 1) for k, v in self.smooth.items()},
             "zones": zones_state, "updated": time.time(),

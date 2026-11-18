@@ -15,7 +15,9 @@ Everything goes through OpenRGB's SDK server; the daemon is plain Python
   every zone flashes red.
 - The bar icon takes the colour of the hottest zone; its panel shows each
   zone's reading and lets you change source, palette and brightness, and has
-  a palette composer: drag a stop's colour and the lights show it live.
+  a palette composer: set a colour for each temperature (stops are shown in
+  °C or % of the zone you preview, along with that source's range), and the
+  lights show the selected stop live.
 - Right-click the icon to pause. Paused or stopped, the daemon loads the OpenRGB
   profile named in `restore_profile`.
 
