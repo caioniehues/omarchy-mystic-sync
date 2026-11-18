@@ -26,9 +26,10 @@ DEFAULTS = {
     },
     "critical": {"cpu-temp": 90, "gpu-hotspot": 100},
     # device: substring of the OpenRGB controller name (default "MSI"); index: zone number on that controller.
-    # JRAINBOW2 (zone 3) is physically dead on this board, so it is left out.
+    # JRAINBOW2 (zone 3) is physically dead on this board; it stays "off" so it is held at 1 LED (see MSI_SYNC_MAX).
     "zones": {
-        "JRAINBOW1": {"label": "Fans", "source": "cpu-temp", "leds": 60, "index": 2},
+        "JRAINBOW1": {"label": "Fans", "source": "cpu-temp", "leds": 40, "index": 2},
+        "JRAINBOW2": {"label": "Dead header", "source": "off", "leds": 1, "index": 3},
         "GPU": {"label": "Nitro+", "source": "gpu-temp", "leds": 1, "index": 0, "device": "Sapphire"},
     },
 }

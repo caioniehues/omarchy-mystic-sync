@@ -31,8 +31,15 @@
     "JRAINBOW1": {
       "label": "Fans",
       "source": "cpu-temp",
-      "leds": 200,
+      "leds": 40,
       "index": 2,
+      "device": "MSI"
+    },
+    "JRAINBOW2": {
+      "label": "Dead header",
+      "source": "off",
+      "leds": 1,
+      "index": 3,
       "device": "MSI"
     },
     "GPU": {

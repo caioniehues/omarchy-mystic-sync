@@ -23,7 +23,7 @@ Light board) with a Sapphire Radeon RX 7800 XT Nitro+.
 
 ```
  /sys (k10temp, amdgpu)  ─►  mystic-sync.service  ──SDK──►  openrgb-server.service  ─►  MSI board (USB HID)
- /proc/stat                  (every 0.25 s)                 (openrgb --server)         Sapphire GPU (I²C)
+ /proc/stat                  (every 0.05 s)                 (openrgb --server)         Sapphire GPU (I²C)
                                     │
                                     └─►  $XDG_RUNTIME_DIR/mystic-sync/state.json  ─►  bar widget (Panel.qml)
 ```
@@ -69,7 +69,7 @@ bin/mystic-sync status    # live readings, colours, connection state
 | `enabled` | `false` pauses and loads `restore_profile` |
 | `brightness` | 0–100 % |
 | `palette` | `thermal`, `ice-fire`, `traffic` or `violet` |
-| `smoothing` | weight of each new sample, (0, 1]; 1 = no smoothing |
+| `smoothing` | weight of each new sample (20 per second), (0, 1]; 0.25 settles in about half a second, 1 = no smoothing |
 | `critical_flash`, `critical` | flash red at these raw readings |
 | `ranges.<source>` | `[low, high]` mapped to the palette's start and end |
 | `zones.<name>` | see below |
@@ -85,13 +85,14 @@ A zone:
 - `index`: zone number on that controller. On the MS-7E26: 0 JRGB1,
   1 JRGB2, 2 JRAINBOW1, 3 JRAINBOW2. The Nitro+ has a single zone, 0.
 - `leds`: LED count. Only MSI zones are resized (JRAINBOW1 up to 200,
-  JRAINBOW2 up to 240); other controllers have a fixed size, so give their real
-  count.
+  JRAINBOW2 up to 240), but 40 or fewer is far faster (see below); other
+  controllers have a fixed size, so give their real count.
 
 ## The setup this repo is configured for
 
 - **JRAINBOW1** drives all six case fans and follows CPU temperature.
-- **JRAINBOW2 is physically dead**, so it isn't in the default zones.
+- **JRAINBOW2 is physically dead.** It is a zone with source `off` anyway, so
+  the daemon holds it at 1 LED (see "40 LEDs or fewer" below).
 - **The GPU** used to take its lighting from the motherboard through its
   "External Control" mode. With that header gone it is driven directly: the
   Nitro+ has no Direct mode, so OpenRGB's custom mode falls back to its per-LED
@@ -109,6 +110,13 @@ A zone:
   chained, but every fan receives the same data from LED 1 (the chain cable is
   a parallel pass-through). Per-fan colours are impossible on such a chain, and
   raising the LED count past the longest fan (about 15 here) changes nothing.
+- **Keep every MSI header at 40 LEDs or fewer, even unused ones.** OpenRGB 1.1
+  then sends each update as one HID report (~1 ms). If any header is longer, it
+  sends one report per header with a 13 ms sleep after each (~29 ms per update,
+  measured with strace). OpenRGB queues those writes in order, so at 20 updates
+  a second the slow path would fall behind. A header left out of `zones` keeps
+  whatever size OpenRGB last saved, so list it with source `off`. If a zone is
+  over 40, the daemon slows its loop to keep up.
 - **Mixed fan models render colours differently.** Fans 4–6 are a different
   model with a much stronger blue. Pure red, green, blue, blue-violet, purple
   and magenta look the same on both models; anything mixing green, or red with

@@ -12,12 +12,16 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import mysticlib as M
 from orgb import OpenRGB
 
-TICK = 0.25          # seconds between sensor samples
+TICK = 0.05          # seconds between samples: sysfs reads take ~0.2 ms and OpenRGB queues updates per device, so the loop is the only lag
 KEEPALIVE = 5.0      # resend colours this often even if unchanged (another client may have overwritten them)
 RESUME_GAP = 10.0    # wall-clock jump between ticks that means the PC slept: re-enable direct mode
 # Never re-send SETCUSTOMMODE routinely: on MSI 185-byte boards OpenRGB answers it with the
 # "enable per-LED" packet, which re-initialises the ARGB headers and blinks pass-through devices (GPU).
 MIN_DELTA = 3        # per-channel change that is worth sending
+# OpenRGB 1.1 queues zone updates in order, never merging them. An MSI update is one ~1 ms HID report while every
+# ARGB header is <= 40 LEDs; past that it is one report per header with 13 ms sleeps between (~29 ms, strace-measured).
+MSI_SYNC_MAX = 40
+MSI_SLOW_WRITE = 0.03
 
 
 class Daemon:
@@ -184,7 +188,11 @@ class Daemon:
             self.tick(now)
             # unreachable server: back off up to 5 s between reconnect attempts, keep sampling meanwhile
             backoff = min(5.0, backoff + 1) if self.client is None and self.cfg["enabled"] else 0.0
-            time.sleep(max(TICK, backoff))
+            # every tick resends each zone; a tick shorter than the MSI writes would grow OpenRGB's queue and the lag with it
+            # shortcut: headers missing from the config keep OpenRGB's size, so a long one there still slows writes unseen
+            msi = [z["leds"] for z in self.cfg["zones"].values() if z["device"] == M.MSI]
+            slow = MSI_SLOW_WRITE * len(msi) if max(msi, default=0) > MSI_SYNC_MAX else 0
+            time.sleep(max(TICK, slow, backoff))
         self.restore()
         try:
             with open(M.state_path()) as f:
