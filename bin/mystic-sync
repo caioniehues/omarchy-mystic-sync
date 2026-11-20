@@ -9,6 +9,7 @@
 import json, os, signal, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import glow
 import mysticlib as M
 from orgb import OpenRGB
 
@@ -115,6 +116,7 @@ class Daemon:
         for i in self.devs.values():
             self.client.custom_mode(i)       # GPU: no Direct mode, OpenRGB falls back to per-LED Static
         self.restored = False
+        glow.fix_card()                      # strip length and brightness, lost on a power cut; never raises
 
     def restore(self):
         name = self.cfg["restore_profile"] if self.cfg else ""

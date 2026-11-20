@@ -105,7 +105,9 @@ A zone:
 - **The GPU** used to take its lighting from the motherboard through its
   "External Control" mode. With that header gone it is driven directly: the
   Nitro+ has no Direct mode, so OpenRGB's custom mode falls back to its per-LED
-  Static mode, one LED for the whole card.
+  Static mode, one LED for the whole card. The daemon also sets two of the
+  card's LED chip registers itself over I²C (`bin/glow.py`), because OpenRGB
+  never writes them (see "A power loss resets the Nitro+ LED chip" below).
 
 ## Things learned the hard way
 
@@ -140,6 +142,16 @@ A zone:
 - **OpenRGB takes ~10–25 s to detect the MSI board.** The GPU shows up first.
   The daemon keeps retrying (up to every 5 s) and reports which controller is
   still missing.
+- **A power loss resets the Nitro+ LED chip.** A shutdown keeps standby power
+  on the card, but cutting power entirely resets its Nitro Glow chip (I²C
+  address `0x28` on the bus named `AMDGPU DM i2c OEM bus`): the strip length
+  (register `0x27`) drops to 6 LEDs, lighting only the first third of the
+  light bar, and the brightness (`0x3E`) to 0, so the card goes dark. OpenRGB
+  writes neither register, nor does Sapphire's TRIXX for the strip length.
+  Wherever the daemon re-prepares the lights, it reads both and restores 36 and
+  100 if they differ; this only happens on the RX 7800 XT Nitro+ (PCI subsystem
+  `1da2:d475`). To fix it by hand: `i2cset -y <bus> 0x28 0x27 36 b` and
+  `i2cset -y <bus> 0x28 0x3E 100 b`.
 - **Stopping the daemon loads `restore_profile`.** If that profile has the GPU
   in External Control and the header is gone, the card goes dark while paused.
   Save the profile again with a GPU colour.
