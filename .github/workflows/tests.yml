@@ -1,0 +1,11 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile the daemon (no test imports bin/mystic-sync)
+        run: python3 -I -m py_compile bin/mystic-sync bin/*.py
+      - name: Unit tests
+        run: python3 -I -m unittest discover -s tests

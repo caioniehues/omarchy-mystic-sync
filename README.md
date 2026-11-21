@@ -151,7 +151,8 @@ A zone:
   Wherever the daemon re-prepares the lights, it reads both and restores 36 and
   100 if they differ; this only happens on the RX 7800 XT Nitro+ (PCI subsystem
   `1da2:d475`). To fix it by hand: `i2cset -y <bus> 0x28 0x27 36 b` and
-  `i2cset -y <bus> 0x28 0x3E 100 b`.
+  `i2cset -y <bus> 0x28 0x3E 100 b`. The chip's register map, and how it was
+  worked out, are in `docs/nitro-glow.md`.
 - **Stopping the daemon loads `restore_profile`.** If that profile has the GPU
   in External Control and the header is gone, the card goes dark while paused.
   Save the profile again with a GPU colour.
@@ -160,7 +161,11 @@ A zone:
 
 ```sh
 python3 -I -m unittest discover -s tests
+python3 -I -m unittest discover -s tests -p test_glow.py   # one file; -I rejects a tests/... path
 ```
+
+CI (`.github/workflows/tests.yml`) runs the suite and compiles `bin/mystic-sync`,
+which no test imports.
 
 ## License
 
